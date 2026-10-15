@@ -8,6 +8,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"log"
 	"net/http"
@@ -51,26 +52,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("[backend] FATAL open db: %v", err)
 	}
+	defer db.Close()
 	db.SetMaxOpenConns(10)
-
-	// Wait for Postgres to accept connections (compose start ordering).
-	for i := 0; i < 30; i++ {
-		if err = db.Ping(); err == nil {
-			break
-		}
-		log.Printf("[backend] waiting for postgres (%d)…", i+1)
-		time.Sleep(2 * time.Second)
-	}
-	if err != nil {
-		log.Fatalf("[backend] FATAL ping db: %v", err)
-	}
-	log.Println("[backend] connected to postgres")
 
 	r := gin.Default()
 
-	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "backend"})
-	})
+	r.GET("/health", liveness)
+	r.GET("/health/live", liveness)
+	r.GET("/health/ready", readiness)
 
 	r.GET("/projects", listProjects)
 	r.POST("/projects", createProject)
@@ -84,6 +73,21 @@ func main() {
 	if err := r.Run(":" + port); err != nil {
 		log.Fatalf("[backend] FATAL: %v", err)
 	}
+}
+
+func liveness(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "backend"})
+}
+
+func readiness(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		log.Printf("[backend] readiness check failed: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "service": "backend"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "backend"})
 }
 
 func listProjects(c *gin.Context) {

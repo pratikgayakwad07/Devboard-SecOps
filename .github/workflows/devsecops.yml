@@ -2,6 +2,9 @@
 
 name: DevSecOps
 
+permissions:
+  contents: read
+
 on:
     push:
         branches: [master]
@@ -35,19 +38,27 @@ jobs:
     code-tests:
         uses: ./.github/workflows/code-tests.yml
 
-    # push-to-docker-hub:
+    # Push immutable containers to ECR.
     docker-push:
         uses: ./.github/workflows/docker-push.yml
         needs: [code-quality,code-tests,sonar-qube,docker-checks,dependency-checks,secret-scanning]
+        permissions:
+            contents: read
+            id-token: write
         secrets: inherit
 
     ## ---- CD -----
     deploy:
         needs: [docker-push]
         uses: ./.github/workflows/deploy.yml
+        permissions:
+            contents: read
+            id-token: write
         secrets: inherit
 
     dast-scan:
         needs: [deploy]
         uses: ./.github/workflows/dast.yml
+        with:
+            target-url: ${{ needs.deploy.outputs.app-url }}
         secrets: inherit

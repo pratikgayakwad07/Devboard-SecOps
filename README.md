@@ -211,7 +211,9 @@ The browser calls these as `/api/...`; the backend serves them at the root.
 | POST   | `/tasks`                  | create a task                         |
 | PATCH  | `/tasks/:id`              | update a task (e.g. change status)    |
 | GET    | `/search?q=&project_id=N` | search tasks by title                 |
-| GET    | `/health`                 | health check                          |
+| GET    | `/health`               | legacy liveness check                 |
+| GET    | `/health/live`          | process liveness (independent of DB)  |
+| GET    | `/health/ready`         | readiness (requires a reachable DB)  |
 
 ## Folder layout
 
@@ -220,6 +222,7 @@ The browser calls these as `/api/...`; the backend serves them at the root.
 ├── docker-compose.yml   starts frontend + backend + postgres together
 ├── Makefile             short commands (make up, make down, ...)
 ├── .env.example         template for settings (copy to .env)
+├── k8s/                  EKS namespace, RBAC, services and hardened workloads
 ├── frontend/            React app (Vite). Serves the UI, forwards /api
 ├── backend/             Go API (main.go + Dockerfile)
 └── init/postgres/       schema + example data, loaded on first start
@@ -229,22 +232,131 @@ The browser calls these as `/api/...`; the backend serves them at the root.
 
 ## CI/CD DevSecOps Setup
 
-The repository contains GitHub Actions workflows configured with SonarQube (SAST) and OWASP ZAP (DAST) scanning.
+The GitHub Actions pipeline runs code quality/tests, secret and dependency
+scans, Dockerfile/image scans, pushes immutable commit-SHA-and-run-attempt-tagged images to Amazon ECR,
+deploys to EKS, and runs OWASP ZAP against the deployed frontend. Docker image
+critical-vulnerability findings and Go vulnerability findings fail their CI
+jobs. DAST findings are currently reported without failing deployment.
+
+Terraform for the VPC, EKS, managed nodes, private RDS PostgreSQL, ECR
+repositories, and GitHub OIDC roles lives in
+[`infra/terraform/`](./infra/terraform/). Its modules use provider-level common
+tags; node AMIs are looked up from AWS Systems Manager Parameter Store, and
+AL2023 EKS `NodeConfig` user data is rendered from the EKS API details. Input
+variables have no Terraform defaults: set infrastructure values in your local
+`terraform.tfvars` file.
+
+### Provision AWS infrastructure
+
+1. Bootstrap a dedicated S3 bucket for Terraform state **outside this stack**.
+   Enable bucket versioning, block public access, and enable server-side
+   encryption. State includes infrastructure metadata and must be access
+   controlled. The backend uses S3 native state locking (`use_lockfile`).
+2. Copy the examples and edit every placeholder:
+
+   ```bash
+   cd infra/terraform
+   cp terraform.tfvars.example terraform.tfvars
+   cp backend.hcl.example backend.hcl
+   ```
+
+   Set a real AWS region, available AZs, subnet CIDRs, and the trusted public
+   egress CIDRs for administrators and the GitHub runner in `terraform.tfvars`.
+   Replace the reserved example `203.0.113.10/32`; never use `0.0.0.0/0` for
+   the EKS API allowlist. A GitHub-hosted runner
+   needs a stable egress range in that list; for a private-only API endpoint,
+   use a secured self-hosted runner in the VPC. Set the state bucket and region
+   in `backend.hcl`.
+3. Initialize, review the plan, and apply:
+
+   ```bash
+   terraform init -backend-config=backend.hcl
+   terraform fmt -check -recursive
+   terraform validate
+   terraform plan -out=devboard.tfplan
+   terraform apply devboard.tfplan
+   ```
+
+   This stack creates the GitHub Actions OIDC provider. If the AWS account
+   already has that provider, import it before the first plan/apply:
+
+   ```bash
+   terraform import module.github_actions.aws_iam_openid_connect_provider.github \
+     arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com
+   ```
+
+   Use the same backend configuration and `terraform.tfvars` for later changes.
+   The example uses NAT gateways in each AZ, a Multi-AZ RDS instance, and
+   deletion protection; these resources incur ongoing AWS charges. Set
+   `single_nat_gateway = true` only when accepting the reduced network
+   availability to lower non-production cost. Do not commit `terraform.tfvars`,
+   `backend.hcl`, state, or plan files. Before a later RDS destroy, disable
+   deletion protection and choose a new unique
+   `postgres_final_snapshot_identifier` if a final snapshot is retained.
+4. As a cluster administrator, bootstrap the namespace and namespace-scoped
+   binding once:
+
+   ```bash
+   aws eks update-kubeconfig --name "$(terraform output -raw eks_cluster_name)" --region "$(terraform output -raw aws_region)"
+   kubectl apply -f ../../k8s/namespace.yaml
+   kubectl apply -f ../../k8s/rbac/deployer-rolebinding.yaml
+   ```
+
+   Terraform creates the GitHub deployer's EKS access entry; the namespaced
+   RoleBinding grants the `devboard-deployers` group the built-in `edit` role
+   only in `devboard`.
+5. Add these **Actions variables** in GitHub repository settings, using
+   `terraform output` values:
+   - `AWS_REGION` = `terraform output -raw aws_region`
+   - `AWS_ECR_REPOSITORY_PREFIX` = `terraform output -raw ecr_repository_prefix`
+   - `AWS_ECR_PUSH_ROLE_ARN` = `terraform output -raw github_ecr_push_role_arn`
+   - `AWS_DEPLOY_ROLE_ARN` = `terraform output -raw github_cluster_deployer_role_arn`
+   - `EKS_CLUSTER_NAME` = `terraform output -raw eks_cluster_name`
+   - `POSTGRES_SECRET_ARN` = `terraform output -raw postgres_secret_arn`
+
+   The EKS API must be reachable from the runner's network. The pipeline
+   assumes separate OIDC roles for image publishing and deployment. The deploy
+   role can read only this RDS secret and describe this cluster; Kubernetes
+   permissions are limited to the `devboard` namespace. The deploy workflow
+   fetches the RDS-managed credential at runtime and creates/updates the
+   Kubernetes Secret without placing the password in GitHub settings or logs.
+6. Initialize the newly created database schema once, from a secured machine
+   that can reach the private RDS endpoint (for example, an approved host in
+   the VPC). Retrieve the RDS-managed credential and construct the TLS-enabled
+   URL without printing the secret:
+
+   ```bash
+   SECRET_ARN="$(terraform output -raw postgres_secret_arn)"
+   POSTGRES_URL="$(aws secretsmanager get-secret-value \
+     --secret-id "$SECRET_ARN" --query SecretString --output text | \
+     python3 -c 'import json,sys; from urllib.parse import quote; s=json.load(sys.stdin); print("postgres://{}:{}@{}:{}/{}?sslmode=require".format(quote(s["username"],safe=""),quote(s["password"],safe=""),s["host"],s["port"],quote(s["dbname"],safe="")))' )"
+   psql "$POSTGRES_URL" -v ON_ERROR_STOP=1 -f ../../init/postgres/01_schema.sql
+   psql "$POSTGRES_URL" -v ON_ERROR_STOP=1 -f ../../init/postgres/02_seed.sql
+   ```
+
+   The seed script is intended for first initialization, not repeated runs.
+   The RDS master credential is stored and rotated by RDS in Secrets Manager;
+   Terraform grants the GitHub deploy role read access to that single secret.
+   Protect the Terraform state bucket and AWS credentials accordingly.
+7. Push to `master`. CI scans and pushes immutable images; deployment waits for
+   the EKS rollout and public frontend load balancer before invoking DAST.
+   The sample frontend service exposes HTTP. Configure TLS, a domain, and
+   appropriate AWS load-balancer ingress before production use.
 
 ### How to Install and Set Up SonarQube on EC2
 
-To run your own self-hosted SonarQube server on your AWS EC2 instance:
+To run a self-hosted SonarQube server, use a secured, TLS-protected host and
+restrict network access to it. Do not expose the default setup publicly:
 
 1. **Start the SonarQube Container**:
-   Ensure Docker is installed on your EC2 instance, then run:
+   Ensure Docker is installed and set a strong initial administrator password:
    ```bash
-   docker run -itd --name SonarQube-Server -p 9000:9000 sonarqube:community
+   docker run -d --name SonarQube-Server -p 127.0.0.1:9000:9000 sonarqube:community
    ```
 
 2. **Access the Web Interface**:
-   - Make sure port `9000` is open in your **AWS EC2 Security Group** inbound rules.
-   - Access `http://<YOUR_EC2_PUBLIC_IP>:9000` in your browser.
-   - Log in using default credentials: Username: `admin` / Password: `admin` (you will be prompted to change it)
+   - Put the server behind a TLS reverse proxy and restrict access to trusted users.
+   - Do not expose port `9000` directly to the public internet.
 
 
 ### How to configure SonarQube Secrets
@@ -264,14 +376,3 @@ To enable SonarQube scanning in your GitHub Actions pipeline:
    - Add two Repository Secrets:
      - `SONAR_TOKEN`: Paste the SonarQube token you copied.
      - `SONAR_HOST_URL`: Paste your SonarQube server URL.
-
-### How to configure Docker Hub Credentials
-
-To allow the CI pipeline to build and push images to Docker Hub:
-1. Navigate to **Settings > Secrets and variables > Actions**.
-2. Under the **Variables** tab, add:
-   - `DOCKERHUB_USERNAME`: Your Docker Hub username.
-3. Under the **Secrets** tab, add:
-   - `DOCKERHUB_TOKEN`: A Personal Access Token (PAT) generated from Docker Hub.
-
-

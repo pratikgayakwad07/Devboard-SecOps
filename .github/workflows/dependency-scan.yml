@@ -1,6 +1,6 @@
-# Goal - I have to ensure the packages & dependencies have been audited for Security
+# Audit Go and Node dependencies.
 
-name: Dependecy scan
+name: Dependency Scan
 
 on:
     workflow_call:
@@ -23,8 +23,7 @@ jobs:
               run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
 
             - name: GoVulncheck
-              continue-on-error: true
-              run: govulncheck ./... > govulncheck-report.txt
+              run: govulncheck ./... | tee govulncheck-report.txt
               working-directory: backend
 
             - name: Setup Node
@@ -43,5 +42,5 @@ jobs:
               uses: actions/upload-artifact@v4
               with:
                 name: dependency-scan-report
-                path: reports/dependency-report.txt
+                path: backend/govulncheck-report.txt
                 retention-days: 5

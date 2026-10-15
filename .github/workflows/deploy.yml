@@ -1,28 +1,107 @@
-# Goal: To deploy the built images from CI Steps once the CI Worklow is Succeeded
+# Deploy immutable ECR images to an existing EKS cluster.
 
 name: CD
 
-on: 
+on:
     workflow_call:
+        outputs:
+            app-url:
+                description: Public URL of the deployed frontend
+                value: ${{ jobs.deploy.outputs.app-url }}
 
 jobs:
     deploy:
-        
-        runs-on: self-hosted
+        runs-on: ubuntu-latest
+        outputs:
+            app-url: ${{ steps.load-balancer.outputs.app-url }}
         steps:
-            - name: Code Checkout
+            - name: Checkout Kubernetes manifests
               uses: actions/checkout@v7
 
-            - name: Copy Example Env to main env
-              run: cp .env.example .env
-
-            - name: Docker Setup [Login]
-              uses: docker/login-action@v4
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@v5
               with:
-                username: ${{ vars.DOCKERHUB_USERNAME }}
-                password: ${{ secrets.DOCKERHUB_TOKEN }}
+                role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+                aws-region: ${{ vars.AWS_REGION }}
 
-            - name: Deploy the containers with Docker Compose
+            - name: Get AWS account ID
+              id: account
+              run: echo "account-id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
+
+            - name: Configure kubectl
+              env:
+                EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+                AWS_REGION: ${{ vars.AWS_REGION }}
+              run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+
+            - name: Configure application database secret
+              env:
+                POSTGRES_SECRET_ARN: ${{ vars.POSTGRES_SECRET_ARN }}
               run: |
-                docker compose pull
-                docker compose up -d
+                set -euo pipefail
+                if [ -z "$POSTGRES_SECRET_ARN" ]; then
+                  echo "POSTGRES_SECRET_ARN GitHub Actions variable is required" >&2
+                  exit 1
+                fi
+                database_secret="$(aws secretsmanager get-secret-value \
+                  --secret-id "$POSTGRES_SECRET_ARN" \
+                  --query SecretString --output text)"
+                POSTGRES_URL="$(DATABASE_SECRET="$database_secret" python3 -c '
+                import json
+                import os
+                from urllib.parse import quote
+
+                secret = json.loads(os.environ["DATABASE_SECRET"])
+                print(
+                    "postgres://{}:{}@{}:{}/{}?sslmode=require".format(
+                        quote(secret["username"], safe=""),
+                        quote(secret["password"], safe=""),
+                        secret["host"],
+                        secret["port"],
+                        quote(secret["dbname"], safe=""),
+                    )
+                )
+                ')"
+                unset database_secret
+                umask 077
+                secret_file="$(mktemp)"
+                trap 'rm -f "$secret_file"' EXIT
+                printf '%s' "$POSTGRES_URL" > "$secret_file"
+                kubectl -n devboard create secret generic devboard-secrets \
+                  --from-file=POSTGRES_URL="$secret_file" \
+                  --dry-run=client -o yaml | kubectl apply -f -
+
+            - name: Apply services and availability budgets
+              run: kubectl apply -f k8s/base/
+
+            - name: Apply application deployments
+              env:
+                BACKEND_IMAGE: ${{ steps.account.outputs.account-id }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/${{ vars.AWS_ECR_REPOSITORY_PREFIX }}-backend:${{ github.sha }}-${{ github.run_attempt }}
+                FRONTEND_IMAGE: ${{ steps.account.outputs.account-id }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/${{ vars.AWS_ECR_REPOSITORY_PREFIX }}-frontend:${{ github.sha }}-${{ github.run_attempt }}
+              run: |
+                set -euo pipefail
+                envsubst '${BACKEND_IMAGE}' < k8s/templates/backend-deployment.yaml | kubectl apply -f -
+                envsubst '${FRONTEND_IMAGE}' < k8s/templates/frontend-deployment.yaml | kubectl apply -f -
+
+            - name: Wait for application rollouts
+              run: |
+                kubectl -n devboard rollout status deployment/backend --timeout=5m
+                kubectl -n devboard rollout status deployment/frontend --timeout=5m
+
+            - name: Wait for public frontend load balancer
+              id: load-balancer
+              run: |
+                set -euo pipefail
+                for attempt in $(seq 1 60); do
+                  endpoint="$(kubectl -n devboard get service frontend -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
+                  if [ -z "$endpoint" ]; then
+                    endpoint="$(kubectl -n devboard get service frontend -o jsonpath='{.status.loadBalancer.ingress[0].ip}')"
+                  fi
+                  if [ -n "$endpoint" ]; then
+                    echo "app-url=http://${endpoint}" >> "$GITHUB_OUTPUT"
+                    exit 0
+                  fi
+                  sleep 10
+                done
+                echo "Timed out waiting for the frontend load balancer address" >&2
+                exit 1

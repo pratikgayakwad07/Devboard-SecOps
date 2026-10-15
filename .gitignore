@@ -9,6 +9,16 @@ dist/
 # env — keep .env local; the committed template is .env.example
 .env
 
+# Terraform state, plans, and local configuration
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+backend.hcl
+crash.log
+.terraform/
+.terraform.lock.hcl
+
 # misc
 .DS_Store
 *.local
